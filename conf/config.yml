@@ -1,0 +1,13 @@
+dataBase:
+  client:
+    host: 127.0.0.1
+    port: "5432"
+    database: "postgres"
+    username: user
+    password: password
+    schema: ""
+  table: "test"
+loader:
+  batchSize: 100
+  shouldIgnoreInsertErrors: false
+  logInterval: 15s
