@@ -21,6 +21,12 @@ const (
 	maxScannerBuf = 1 << 20 /* 1 MB */
 )
 
+type queryPayload struct {
+	query       string
+	args        []any
+	columnCount int
+}
+
 type loader struct {
 	scanner *bufio.Scanner
 	db      db.DB
@@ -31,10 +37,8 @@ type loader struct {
 	readCounter *atomic.Uint64
 	loadCounter *atomic.Uint64
 
-	table                    string
-	batchSize                uint64
-	logInterval              time.Duration
-	shouldIgnoreInsertErrors bool
+	table string
+	cfg   conf.Loader
 }
 
 func New(db db.DB, logger log.Logger, cfg conf.Loader, filePath string, table string) (loader, error) {
@@ -47,17 +51,15 @@ func New(db db.DB, logger log.Logger, cfg conf.Loader, filePath string, table st
 	scanner.Buffer(make([]byte, maxScannerBuf), maxScannerBuf)
 
 	return loader{
-		scanner:                  scanner,
-		db:                       db,
-		logger:                   logger,
-		wg:                       new(sync.WaitGroup),
-		errChan:                  make(chan error),
-		readCounter:              new(atomic.Uint64),
-		loadCounter:              new(atomic.Uint64),
-		table:                    table,
-		batchSize:                cfg.BatchSize,
-		logInterval:              cfg.LogInterval,
-		shouldIgnoreInsertErrors: cfg.ShouldIgnoreInsertErrors,
+		scanner:     scanner,
+		db:          db,
+		logger:      logger,
+		wg:          new(sync.WaitGroup),
+		errChan:     make(chan error),
+		readCounter: new(atomic.Uint64),
+		loadCounter: new(atomic.Uint64),
+		table:       table,
+		cfg:         cfg,
 	}, nil
 }
 
@@ -66,8 +68,13 @@ func (l loader) LoadData(ctx context.Context) error {
 	l.readCounter.Store(0)
 	l.loadCounter.Store(0)
 
-	if l.logInterval > 0 {
+	if l.cfg.LogInterval > 0 {
 		l.logProgress(ctx)
+	}
+
+	queryQueue := make(chan queryPayload, l.cfg.WorkerCount)
+	for range l.cfg.WorkerCount {
+		l.execQueryAsync(ctx, queryQueue)
 	}
 
 	var (
@@ -101,12 +108,16 @@ func (l loader) LoadData(ctx context.Context) error {
 		builder = builder.Values(values...)
 
 		count := l.readCounter.Add(1)
-		if count%l.batchSize == 0 {
+		if count%l.cfg.BatchSize == 0 {
 			q, args, err := builder.ToSql()
 			if err != nil {
 				return errors.WithMessage(err, "build batch insert query")
 			}
-			l.execQueryAsync(ctx, q, args, len(columns))
+			queryQueue <- queryPayload{
+				query:       q,
+				args:        args,
+				columnCount: len(columns),
+			}
 
 			builder = query.New().
 				Insert(l.table).
@@ -114,12 +125,16 @@ func (l loader) LoadData(ctx context.Context) error {
 		}
 	}
 
-	if l.readCounter.Load()%l.batchSize != 0 {
+	if l.readCounter.Load()%l.cfg.BatchSize != 0 {
 		q, args, err := builder.ToSql()
 		if err != nil {
 			return errors.WithMessage(err, "build batch insert query")
 		}
-		l.execQueryAsync(ctx, q, args, len(columns))
+		queryQueue <- queryPayload{
+			query:       q,
+			args:        args,
+			columnCount: len(columns),
+		}
 	}
 
 	go func() {
@@ -131,6 +146,7 @@ func (l loader) LoadData(ctx context.Context) error {
 	if err != nil {
 		return errors.WithMessage(err, "scan")
 	}
+	close(queryQueue)
 
 	select {
 	case err := <-l.errChan:
@@ -140,27 +156,29 @@ func (l loader) LoadData(ctx context.Context) error {
 	}
 }
 
-func (l loader) execQueryAsync(ctx context.Context, query string, args []any, columnCount int) {
+func (l loader) execQueryAsync(ctx context.Context, queue <-chan queryPayload) {
 	l.wg.Add(1)
 	go func() {
 		defer l.wg.Done()
-		_, err := l.db.Exec(ctx, query, args...)
-		if err == nil {
-			count := uint64(len(args) / columnCount) // nolint:gosec
-			l.loadCounter.Add(count)
-			return
-		}
+		for v := range queue {
+			_, err := l.db.Exec(ctx, v.query, v.args...)
+			if err == nil {
+				count := uint64(len(v.args) / v.columnCount) // nolint:gosec
+				l.loadCounter.Add(count)
+				continue
+			}
 
-		if l.shouldIgnoreInsertErrors {
-			l.logger.Warn(ctx, errors.WithMessage(err, "exec batch insert query"))
-			return
+			if l.cfg.ShouldIgnoreInsertErrors {
+				l.logger.Warn(ctx, errors.WithMessage(err, "exec batch insert query"))
+				continue
+			}
+			l.errChan <- errors.WithMessage(err, "exec batch insert query")
 		}
-		l.errChan <- errors.WithMessage(err, "exec batch insert query")
 	}()
 }
 
 func (l loader) logProgress(ctx context.Context) {
-	ticker := time.NewTicker(l.logInterval)
+	ticker := time.NewTicker(l.cfg.LogInterval)
 	go func() {
 		defer ticker.Stop()
 		var (
@@ -174,9 +192,9 @@ func (l loader) logProgress(ctx context.Context) {
 			l.logger.Info(ctx, fmt.Sprintf(
 				"read %d data rows in %s; loaded %d data rows in %s; %0.2f%% successful data loading",
 				newReadCount-readCount,
-				l.logInterval,
+				l.cfg.LogInterval,
 				newLoadCount-loadCount,
-				l.logInterval,
+				l.cfg.LogInterval,
 				float64(newLoadCount)/float64(newReadCount)*100, // nolint:mnd
 			))
 
