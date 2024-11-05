@@ -9,5 +9,6 @@ dataBase:
   table: "test"
 loader:
   batchSize: 100
+  workerCount: 64
   shouldIgnoreInsertErrors: false
   logInterval: 15s

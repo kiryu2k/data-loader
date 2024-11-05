@@ -21,6 +21,7 @@ type dataBase struct {
 
 type Loader struct {
 	BatchSize                uint64 `validate:"required,min=100,max=10000"`
+	WorkerCount              uint64 `validate:"required,min=1,max=1024"`
 	LogInterval              time.Duration
 	ShouldIgnoreInsertErrors bool
 }
